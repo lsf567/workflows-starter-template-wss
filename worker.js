@@ -26,9 +26,9 @@ const maxHeavyDoShardCount = 4;
 //    - 在此模式下，这两个参数共同构成了一个精确的速度限制器。
 // ---------------------------------------------------------------------------------
 /** 下行使用pipe管道开关。true: 启用pipe管道。false: 使用手动循环。*/
-const wsDownloadUserPipe = false; //TCP到Websocket下行
+const wsDownloadUserPipe = true; //TCP到Websocket下行
 /** 缓冲发送模式开关。true: 启用缓冲层，聚合发送可降低发送send()调用开销，但是会增加数据转发延迟。false: 不使用缓冲层。*/
-const wsUserBufferer = true;//TCP到Websocket使用缓冲
+const wsUserBufferer = false;//TCP到Websocket使用缓冲
 /** 缓冲区最大大小。用于计算速度上限。*/
 const bufferSize = 512 * 1024; // 512KB
 /** 发送调用刷新时间(毫秒)。设定固定的发送频率以控制速度。*/
@@ -38,7 +38,7 @@ const flushTime = 8; // 8ms
 /** TCPsocket并发获取，可提高tcp连接成功率*/
 const concurrentOnlyDomain = false;//只对域名并发开关
 /**- **警告**: snippets只能设置为1，worker最大支持6，超过6没意义*/
-const concurrency = 4;//socket获取并发数
+const concurrency = 1;//socket获取并发数
 // ---------------------------------------------------------------------------------
 // 三者的 socket 获取顺序；全局模式按这三者依次尝试，非全局模式为：直连 > socks > http > nat64 > ip备用出口 > finallyProxyHost
 /**- **警告**: snippets只支持最大两次connect，所以snippets全局nat64不能使用域名访问，snippets访问cf失败的备用只有第一个有效*/
@@ -126,6 +126,9 @@ const isDomainName = (inputStr) => {
     if (inputStr[0].charCodeAt(0) < 48 || inputStr[0].charCodeAt(0) > 57) return true;
     return !isIPv4optimized(inputStr);
 };
+const closeSocketQuietly = (socket) => {
+    try {socket?.close()} catch {}
+};
 const createConnect = (hostname, port, socket = connect({hostname, port})) => socket.opened.then(() => socket);
 const concurrentConnect = (hostname, port, addrType) => {
     if (concurrency === 1 || (concurrentOnlyDomain && addrType !== 3)) return createConnect(hostname, port);
@@ -136,25 +139,33 @@ const connectViaSocksProxy = async (targetAddrType, targetPortNum, socksAuth, ta
     const socksSocket = await concurrentConnect(socksAuth.hostname, socksAuth.port, addrType);
     const writer = socksSocket.writable.getWriter();
     const reader = socksSocket.readable.getReader();
-    await writer.write(socks5Init);
-    const {value: authResponse} = await reader.read();
-    if (!authResponse || authResponse[0] !== 5 || authResponse[1] === 0xFF) return null;
-    if (authResponse[1] === 2) {
-        if (!socksAuth.username) return null;
-        const userBytes = textEncoder.encode(socksAuth.username);
-        const passBytes = textEncoder.encode(socksAuth.password || '');
-        await writer.write(new Uint8Array([1, userBytes.length, ...userBytes, passBytes.length, ...passBytes]));
-        const {value: authResult} = await reader.read();
-        if (!authResult || authResult[0] !== 1 || authResult[1] !== 0) return null;
-    } else if (authResponse[1] !== 0) {return null}
-    await writer.write(new Uint8Array([
-        5, 1, 0, targetAddrType,
-        ...(targetAddrType === 3 ? [targetAddrBytes.length] : []),
-        ...targetAddrBytes, targetPortNum >> 8, targetPortNum & 0xff]));
-    const {value: finalResponse} = await reader.read();
-    if (!finalResponse || finalResponse[1] !== 0) return null;
-    writer.releaseLock(), reader.releaseLock();
-    return socksSocket;
+    let connected = false;
+    try {
+        await writer.write(socks5Init);
+        const {value: authResponse} = await reader.read();
+        if (!authResponse || authResponse[0] !== 5 || authResponse[1] === 0xFF) return null;
+        if (authResponse[1] === 2) {
+            if (!socksAuth.username) return null;
+            const userBytes = textEncoder.encode(socksAuth.username);
+            const passBytes = textEncoder.encode(socksAuth.password || '');
+            await writer.write(new Uint8Array([1, userBytes.length, ...userBytes, passBytes.length, ...passBytes]));
+            const {value: authResult} = await reader.read();
+            if (!authResult || authResult[0] !== 1 || authResult[1] !== 0) return null;
+        } else if (authResponse[1] !== 0) {return null}
+        await writer.write(new Uint8Array([
+            5, 1, 0, targetAddrType,
+            ...(targetAddrType === 3 ? [targetAddrBytes.length] : []),
+            ...targetAddrBytes, targetPortNum >> 8, targetPortNum & 0xff]));
+        const {value: finalResponse} = await reader.read();
+        if (!finalResponse || finalResponse[1] !== 0) return null;
+        connected = true;
+        return socksSocket;
+    } catch {return null}
+    finally {
+        try {writer.releaseLock()} catch {}
+        try {reader.releaseLock()} catch {}
+        if (!connected) closeSocketQuietly(socksSocket);
+    }
 };
 const staticHeadersPart = `User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\r\nProxy-Connection: Keep-Alive\r\nConnection: Keep-Alive\r\n\r\n`;
 const encodedStaticHeaders = textEncoder.encode(staticHeadersPart);
@@ -170,46 +181,53 @@ const connectViaHttpProxy = async (targetAddrType, targetPortNum, httpAuth, targ
     const fullHeaders = new Uint8Array(encodedDynamicHeaders.length + encodedStaticHeaders.length);
     fullHeaders.set(encodedDynamicHeaders);
     fullHeaders.set(encodedStaticHeaders, encodedDynamicHeaders.length);
-    await writer.write(fullHeaders);
-    writer.releaseLock();
     const reader = proxySocket.readable.getReader();
     const buffer = new Uint8Array(256);
     let bytesRead = 0, statusChecked = false;
-    while (bytesRead < buffer.length) {
-        const {value, done} = await reader.read();
-        if (done || bytesRead + value.length > buffer.length) return null;
-        const prevBytesRead = bytesRead;
-        buffer.set(value, bytesRead);
-        bytesRead += value.length;
-        if (!statusChecked && bytesRead >= 12) {
-            if (buffer[9] !== 50) return null;
-            statusChecked = true;
-        }
-        const searchStart = Math.max(15, prevBytesRead - 3);
-        for (let i = searchStart; i <= bytesRead - 4; i++) {
-            let found = true;
-            for (let j = 0; j < 4; j++) {
-                if (buffer[i + j] !== httpHeaderEnd[j]) {
-                    found = false;
-                    break;
+    let connected = false;
+    try {
+        await writer.write(fullHeaders);
+        while (bytesRead < buffer.length) {
+            const {value, done} = await reader.read();
+            if (done || bytesRead + value.length > buffer.length) return null;
+            const prevBytesRead = bytesRead;
+            buffer.set(value, bytesRead);
+            bytesRead += value.length;
+            if (!statusChecked && bytesRead >= 12) {
+                if (buffer[9] !== 50) return null;
+                statusChecked = true;
+            }
+            const searchStart = Math.max(15, prevBytesRead - 3);
+            for (let i = searchStart; i <= bytesRead - 4; i++) {
+                let found = true;
+                for (let j = 0; j < 4; j++) {
+                    if (buffer[i + j] !== httpHeaderEnd[j]) {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) {
+                    if (bytesRead > i + 4) {
+                        const {readable, writable} = new TransformStream();
+                        const writer = writable.getWriter();
+                        writer.write(buffer.subarray(i + 4, bytesRead));
+                        writer.releaseLock();
+                        proxySocket.readable.pipeTo(writable).catch(() => {});
+                        // @ts-ignore
+                        proxySocket.readable = readable;
+                    }
+                    connected = true;
+                    return proxySocket;
                 }
             }
-            if (found) {
-                reader.releaseLock();
-                if (bytesRead > i + 4) {
-                    const {readable, writable} = new TransformStream();
-                    const writer = writable.getWriter();
-                    writer.write(buffer.subarray(i + 4, bytesRead));
-                    writer.releaseLock();
-                    proxySocket.readable.pipeTo(writable).catch(() => {});
-                    // @ts-ignore
-                    proxySocket.readable = readable;
-                }
-                return proxySocket;
-            }
         }
+        return null;
+    } catch {return null}
+    finally {
+        try {writer.releaseLock()} catch {}
+        try {reader.releaseLock()} catch {}
+        if (!connected) closeSocketQuietly(proxySocket);
     }
-    return null;
 };
 const parseAddress = (buffer, offset, addrType) => {
     const addressLength = addrType === 3 ? buffer[offset++] : addrType === 1 ? 4 : addrType === 4 ? 16 : null;
@@ -483,7 +501,7 @@ const handleWebSocketConn = async (webSocket, request) => {
                 tcpSocket = await establishTcpConnection(parsedRequest, request);
                 if (!tcpSocket) throw new Error();
                 const tcpWriter = tcpSocket.writable.getWriter();
-                if (payload.byteLength) tcpWriter.write(payload);
+                if (payload.byteLength) await tcpWriter.write(payload);
                 messageHandler = (chunk) => tcpWriter.write(chunk);
                 if (wsDownloadUserPipe) {
                     const streamChain = wsUserBufferer ? tcpSocket.readable.pipeThrough(streamPipe()) : tcpSocket.readable;
