@@ -1,6 +1,3 @@
-main = "worker.js"
-compatibility_date = "2026-03-13"
-
 [[durable_objects.bindings]]
 name = "HEAVY_DO"
 class_name = "HeavyDo"
