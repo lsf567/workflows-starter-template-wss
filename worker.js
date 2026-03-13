@@ -32,12 +32,12 @@ const wsUserBufferer = true;//TCP到Websocket使用缓冲
 const bufferSize = 512 * 1024; // 512KB
 /** 发送调用刷新时间(毫秒)。设定固定的发送频率以控制速度。*/
 /**- **警告**: 设置过低  会因定时器精度和高频创建/销毁开销导致 CPU 负担加重。*/
-const flushTime = 2; // 2ms
+const flushTime = 8; // 8ms
 // ---------------------------------------------------------------------------------
 /** TCPsocket并发获取，可提高tcp连接成功率*/
 const concurrentOnlyDomain = false;//只对域名并发开关
 /**- **警告**: snippets只能设置为1，worker最大支持6，超过6没意义*/
-let concurrency = 4;//socket获取并发数
+const concurrency = 4;//socket获取并发数
 // ---------------------------------------------------------------------------------
 // 三者的 socket 获取顺序；全局模式按这三者依次尝试，非全局模式为：直连 > socks > http > nat64 > ip备用出口 > finallyProxyHost
 /**- **警告**: snippets只支持最大两次connect，所以snippets全局nat64不能使用域名访问，snippets访问cf失败的备用只有第一个有效*/
@@ -390,6 +390,12 @@ const streamPipe = (initialChunk) => {
                 flushBuffer(controller);
                 controller.enqueue(chunk);
             } else {
+                if (chunk.length > safeBufferSize) {
+                    flushBuffer(controller);
+                    controller.enqueue(chunk);
+                    return;
+                }
+                if (offset + chunk.length > buffer.length) flushBuffer(controller);
                 buffer.set(chunk, offset);
                 offset += chunk.length;
                 timerId || (timerId = setTimeout(() => flushBuffer(controller), flushTime));
@@ -419,6 +425,12 @@ const manualPipe = async (readable, writable, initialChunk, userCache) => {
                 flushBuffer();
                 writable.send(chunk);
             } else {
+                if (chunk.length > safeBufferSize) {
+                    flushBuffer();
+                    writable.send(chunk);
+                    continue;
+                }
+                if (offset + chunk.length > buffer.length) flushBuffer();
                 buffer.set(chunk, offset);
                 offset += chunk.length;
                 timerId || (timerId = setTimeout(flushBuffer, flushTime));
@@ -436,10 +448,10 @@ const handleWebSocketConn = async (webSocket, request) => {
             if (earlyData) controller.enqueue(earlyData);
             webSocket.addEventListener("message", event => controller.enqueue(event.data));
         },
-        cancel() {if (!earlyData) webSocket.close()}
+        cancel() {webSocket.close()}
     });
     let messageHandler, tcpSocket;
-    const closeSocket = () => {if (!earlyData) {tcpSocket?.close(), webSocket?.close()}};
+    const closeSocket = () => {tcpSocket?.close(), webSocket?.close()};
     webSocketStream.pipeTo(new WritableStream({
         async write(chunk) {
             if (messageHandler) return messageHandler(chunk);
