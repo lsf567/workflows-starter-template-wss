@@ -1,4 +1,4 @@
-name = "worker-name"
+name = "workflows-starter-template-wss"
 main = "worker.js"
 compatibility_date = "2026-03-13"
 workers_dev = true
