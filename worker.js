@@ -1,27 +1,23 @@
 /*
 // 代码基本都抄的CM和天书大佬的项目，在此感谢各位大佬的无私奉献。
-// 支持xhttp和trojan和vless和ss协议,ss协议无密码，ss协议只能纯手搓
-// ws模式的vless导入链接：vless://{这里写uuid}@104.16.40.11:2053?encryption=none&security=tls&sni={这里写域名}&alpn=http%2F1.1&fp=chrome&type=ws&host={这里写域名}#vless
-// ws模式的trojan导入链接：trojan://{这里写密码}@104.16.40.11:2053?security=tls&sni={这里写域名}&alpn=http%2F1.1&fp=chrome&allowInsecure=1&type=ws&host={这里写域名}#trojan
-// xhttp模式的vless导入链接：vless://{这里写uuid}@104.16.40.11:2053?encryption=none&security=tls&sni={这里写域名}&alpn=h2&fp=chrome&allowInsecure=1&type=xhttp&host={这里写域名}&mode=stream-one#vless-xhttp
-// xhttp模式的trojan导入链接：trojan://passwd@104.16.40.11:2053?security=tls&sni=sni&alpn=h2&fp=chrome&allowInsecure=1&type=xhttp&host=host&path=%2F&mode=stream-one#trojan-xhttp
-// 复制协议开头的导入链接导入再手动修改即可
- * ========================== URL路径参数速查表 ==========================
- * 多个参数用 & 连接, 示例: /?s5=host:port&ip=1.2.3.4:443
- * s5/gs5/socks/s5all         - 直连失败SOCKS5代理 / 全局SOCKS5        示例: s5=user:pass@host:port
- * http/ghttp/httpall         - 直连失败HTTP代理 / 全局HTTP            示例: http=user:pass@host:port
- * nat64/gnat64/nat64all      - 直连失败NAT64转换 / 全局NAT64          示例: nat64=64:ff9b::
- * ip/pyip/proxyip            - 直连失败时的备用IP                     示例: ip=1.2.3.4:443
- * proxyall/globalproxy       - 全局代理标志,无s5和http参数时纯直连      示例: proxyall=1 路径中有proxyall即可
- * =======================================================================*/
+// 当前仅支持 WS 模式的 VLESS 协议。
+// ws 模式导入链接：vless://{这里写uuid}@104.16.40.11:2053?encryption=none&security=tls&sni={这里写域名}&alpn=http%2F1.1&fp=chrome&type=ws&host={这里写域名}#vless
+// 复制导入链接后按需修改域名、UUID、端口即可。
+ * ======================= URL 路径参数速查表 =======================
+ * 多个参数用 & 连接，示例：/?s5=host:port&ip=1.2.3.4:443
+ * s5 / socks               - 直连失败时使用 SOCKS5 代理              示例: s5=user:pass@host:port
+ * gs5 / s5all              - 全局 SOCKS5 代理                        示例: gs5=user:pass@host:port
+ * http                     - 直连失败时使用 HTTP 代理                示例: http=user:pass@host:port
+ * ghttp / httpall          - 全局 HTTP 代理                          示例: ghttp=user:pass@host:port
+ * nat64                    - 直连失败时使用 NAT64                    示例: nat64=64:ff9b::
+ * gnat64 / nat64all        - 全局 NAT64                              示例: gnat64=64:ff9b::
+ * ip                       - 直连失败时的备用出口地址                示例: ip=1.2.3.4:443
+ * proxyall / globalproxy   - 无直连，直接按全局代理顺序出站          示例: proxyall=1
+ * ==================================================================*/
 import {DurableObject} from 'cloudflare:workers';
 import {connect} from 'cloudflare:sockets';
 const uuid = '374b719e-1487-49ac-8303-1697301950d6';//vless使用的uuid
-//**警告**:trojan使用的sha224密钥，需要自己计算，当前设置为密码666的密钥
-//**警告**:trojan使用的sha224密钥，需要自己计算，当前设置为密码666的密钥
-//**警告**:trojan使用的sha224密钥，需要自己计算，当前设置为密码666的密钥
-//**警告**:trojan使用的sha224密钥计算网址：https://www.lzltool.com/data-sha224
-const passWordSha224 = '509eece82eb6910bebef9af9496092d3244b6c0d69ef3aaa4b12c565';
+const heavyDoShardCount = 1;//免费版建议保持1，避免每条连接独占一个DO导致GB-sec暴涨
 // ---------------------------------------------------------------------------------
 // 理论最大带宽计算公式 (Theoretical Max Bandwidth Calculation):
 //    - 速度上限 (Mbps) = (bufferSize (字节) / flushTime (毫秒)) * 0.008
@@ -30,10 +26,8 @@ const passWordSha224 = '509eece82eb6910bebef9af9496092d3244b6c0d69ef3aaa4b12c565
 // ---------------------------------------------------------------------------------
 /** 下行使用pipe管道开关。true: 启用pipe管道。false: 使用手动循环。*/
 const wsDownloadUserPipe = false; //TCP到Websocket下行
-const xhttpDownloadUserPipe = false; //XHTTP下行
 /** 缓冲发送模式开关。true: 启用缓冲层，聚合发送可降低发送send()调用开销，但是会增加数据转发延迟。false: 不使用缓冲层。*/
 const wsUserBufferer = true;//TCP到Websocket使用缓冲
-const xhttpUserBufferer = true;//XHTTP使用缓冲
 /** 缓冲区最大大小。用于计算速度上限。*/
 const bufferSize = 512 * 1024; // 512KB
 /** 发送调用刷新时间(毫秒)。设定固定的发送频率以控制速度。*/
@@ -45,14 +39,14 @@ const concurrentOnlyDomain = false;//只对域名并发开关
 /**- **警告**: snippets只能设置为1，worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
 // ---------------------------------------------------------------------------------
-//三者的socket获取顺序，全局模式下为这三个的顺序，非全局为：直连>socks>http>nat64>proxyip>finallyProxyHost
+// 三者的 socket 获取顺序；全局模式按这三者依次尝试，非全局模式为：直连 > socks > http > nat64 > ip备用出口 > finallyProxyHost
 /**- **警告**: snippets只支持最大两次connect，所以snippets全局nat64不能使用域名访问，snippets访问cf失败的备用只有第一个有效*/
 const proxyStrategyOrder = ['socks', 'http', 'nat64'];
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
 const dohNatEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
 const dohFetchOptions = {method: 'POST', headers: {'content-type': 'application/dns-message'}};
-const proxyIpAddrs = {EU: 'ProxyIP.DE.CMLiussss.net', AS: 'ProxyIP.SG.CMLiussss.net', JP: 'ProxyIP.JP.CMLiussss.net', US: 'ProxyIP.US.CMLiussss.net'};//分区域proxyip
-const finallyProxyHost = 'ProxyIP.CMLiussss.net';//兜底proxyip
+const proxyIpAddrs = {EU: 'ProxyIP.DE.CMLiussss.net', AS: 'ProxyIP.SG.CMLiussss.net', JP: 'ProxyIP.JP.CMLiussss.net', US: 'ProxyIP.US.CMLiussss.net'};//分区域备用出口
+const finallyProxyHost = 'ProxyIP.CMLiussss.net';//最终兜底出口
 const coloRegions = {
     JP: new Set(['FUK', 'ICN', 'KIX', 'NRT', 'OKA']),
     EU: new Set([
@@ -67,9 +61,8 @@ const coloRegions = {
         'PAT', 'PBH', 'PER', 'PNH', 'SGN', 'SIN', 'SYD', 'TPE', 'ULN', 'VTE'])
 };
 const coloToProxyMap = new Map(Object.entries(coloRegions).flatMap(([region, colos]) => Array.from(colos, colo => [colo, proxyIpAddrs[region]])));
-const uuidBytes = new Uint8Array(16), hashBytes = new Uint8Array(56), offsets = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4, 4];
+const uuidBytes = new Uint8Array(16), offsets = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4, 4];
 for (let i = 0, c; i < 16; i++) uuidBytes[i] = (((c = uuid.charCodeAt(i * 2 + offsets[i])) > 64 ? c + 9 : c) & 0xF) << 4 | (((c = uuid.charCodeAt(i * 2 + offsets[i] + 1)) > 64 ? c + 9 : c) & 0xF);
-for (let i = 0; i < 56; i++) hashBytes[i] = passWordSha224.charCodeAt(i);
 const [textEncoder, textDecoder, socks5Init, httpHeaderEnd] = [new TextEncoder(), new TextDecoder(), new Uint8Array([5, 2, 0, 2]), new Uint8Array([13, 10, 13, 10])];
 const html = `<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx/1.25.3</center></body></html>`;
 const binaryAddrToString = (addrType, addrBytes) => {
@@ -234,21 +227,6 @@ const parseRequestData = (firstChunk) => {
     const addressInfo = parseAddress(firstChunk, offset + 3, addrType);
     if (!addressInfo) return null;
     return {addrType, ...addressInfo, port, isDns: port === 53};
-};
-const parseTransparent = (firstChunk) => {
-    for (let i = 0; i < 56; i++) if (firstChunk[i] !== hashBytes[i]) return null;
-    const addrType = firstChunk[59];
-    const addressInfo = parseAddress(firstChunk, 60, addrType);
-    if (!addressInfo) return null;
-    const port = (firstChunk[addressInfo.dataOffset] << 8) | firstChunk[addressInfo.dataOffset + 1];
-    return {addrType, ...addressInfo, port, dataOffset: addressInfo.dataOffset + 4, isDns: port === 53};
-};
-const parseShadow = (firstChunk) => {
-    const addrType = firstChunk[0];
-    const addressInfo = parseAddress(firstChunk, 1, addrType);
-    if (!addressInfo) return null;
-    const port = (firstChunk[addressInfo.dataOffset] << 8) | firstChunk[addressInfo.dataOffset + 1];
-    return {addrType, ...addressInfo, port, dataOffset: addressInfo.dataOffset + 2, isDns: port === 53};
 };
 const ipv4ToNat64Ipv6 = (ipv4Address, nat64Prefixes) => {
     const parts = ipv4Address.split('.');
@@ -467,11 +445,9 @@ const handleWebSocketConn = async (webSocket, request) => {
             if (messageHandler) return messageHandler(chunk);
             chunk = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
             let parsedRequest;
-            if (chunk.length > 58 && chunk[56] === 0x0d && chunk[57] === 0x0a) {
-                parsedRequest = parseTransparent(chunk);
-            } else if ((parsedRequest = parseRequestData(chunk))) {
+            if ((parsedRequest = parseRequestData(chunk))) {
                 webSocket.send(new Uint8Array([chunk[0], 0]));
-            } else {parsedRequest = parseShadow(chunk)}
+            }
             if (!parsedRequest) throw new Error();
             const payload = chunk.subarray(parsedRequest.dataOffset);
             if (parsedRequest.isDns) {
@@ -491,84 +467,23 @@ const handleWebSocketConn = async (webSocket, request) => {
         }
     })).catch(() => closeSocket()).finally(() => closeSocket());
 };
-const xhttpResponseHeaders = {'Content-Type': 'application/octet-stream', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
-const handleXhttp = async (request) => {
-    const reader = request.body.getReader();
-    let buffer = new Uint8Array(4096), used = 0, parsedRequest = null, resVersion = null, responseStream;
-    while (true) {
-        const {value, done} = await reader.read();
-        if (done) return new Response(null, {status: 500});
-        if (used + value.length > buffer.length) {
-            const newBuffer = new Uint8Array(Math.max(buffer.length * 2, used + value.length));
-            newBuffer.set(buffer.subarray(0, used));
-            buffer = newBuffer;
-        }
-        buffer.set(value, used);
-        used += value.length;
-        if (used < 48) continue;
-        const currentBuffer = buffer.subarray(0, used);
-        if (currentBuffer.length > 58 && currentBuffer[56] === 0x0d && currentBuffer[57] === 0x0a) {
-            parsedRequest = parseTransparent(currentBuffer);
-        } else if ((parsedRequest = parseRequestData(currentBuffer))) {
-            resVersion = new Uint8Array([buffer[0], 0]);
-        } else {parsedRequest = parseShadow(currentBuffer)}
-        if (parsedRequest) break;
-    }
-    if (!parsedRequest) return new Response(null, {status: 500});
-    try {
-        const payload = buffer.subarray(parsedRequest.dataOffset, used);
-        if (parsedRequest.isDns) {
-            const dohResult = await dohDnsHandler(payload);
-            if (resVersion) {
-                responseStream = new Uint8Array(2 + dohResult.byteLength);
-                responseStream.set(resVersion, 0);
-                responseStream.set(dohResult, 2);
-            } else {responseStream = dohResult}
-        } else {
-            const tcpSocket = await establishTcpConnection(parsedRequest, request);
-            if (!tcpSocket) return new Response(null, {status: 500});
-            const requestToTcp = async () => {
-                const writer = tcpSocket.writable.getWriter();
-                if (payload.byteLength) writer.write(payload);
-                writer.releaseLock();
-                reader.releaseLock();
-                await request.body.pipeTo(tcpSocket.writable);
-            };
-            requestToTcp().catch(() => tcpSocket.close());
-            if (xhttpDownloadUserPipe) {
-                const tcpToResponse = xhttpUserBufferer ? streamPipe(resVersion) : new TransformStream({
-                    start(controller) {controller.enqueue(resVersion)},
-                    transform(chunk, controller) {controller.enqueue(chunk)}
-                });
-                responseStream = tcpSocket.readable.pipeThrough(tcpToResponse);
-            } else {
-                responseStream = new ReadableStream({
-                    start(controller) {
-                        const writable = {send: (chunk) => controller.enqueue(chunk)};
-                        manualPipe(tcpSocket.readable, writable, resVersion, xhttpUserBufferer).then(() => controller.close()).catch(err => controller.error(err));
-                    }
-                });
-            }
-        }
-        return new Response(responseStream, {headers: xhttpResponseHeaders});
-    } catch {return new Response(null, {status: 500})}
-};
 const isWebSocketUpgrade = (request) => request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
-const getHeavyDoName = (request) => {
-    const wsKey = request.headers.get('sec-websocket-key');
-    if (wsKey) return `ws:${wsKey}`;
-    const cfRay = request.headers.get('cf-ray');
-    if (cfRay) return `http:${cfRay}`;
-    const clientIp = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown';
-    return `http:${clientIp}:${crypto.randomUUID()}`;
+const hashString = (input) => {
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
+    return hash;
 };
-const shouldOffloadToHeavyDo = (request, env) => !!env?.HEAVY_DO && (request.method === 'POST' || isWebSocketUpgrade(request));
+const getHeavyDoName = (request) => {
+    if (heavyDoShardCount <= 1) return 'singleton';
+    const clientKey = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || request.headers.get('sec-websocket-key') || 'default';
+    return `shard:${hashString(clientKey) % heavyDoShardCount}`;
+};
+const shouldOffloadToHeavyDo = (request, env) => !!env?.HEAVY_DO && isWebSocketUpgrade(request);
 const routeToHeavyDo = (request, env) => {
     const id = env.HEAVY_DO.idFromName(getHeavyDoName(request));
     return env.HEAVY_DO.get(id).fetch(request);
 };
 const handleRequest = (request) => {
-    if (request.method === 'POST') return handleXhttp(request);
     if (isWebSocketUpgrade(request)) {
         const {0: clientSocket, 1: webSocket} = new WebSocketPair();
         webSocket.accept();
