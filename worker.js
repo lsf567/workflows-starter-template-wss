@@ -22,7 +22,7 @@ const maxHeavyDoShardCount = 4;
 // ---------------------------------------------------------------------------------
 // 理论最大带宽计算公式 (Theoretical Max Bandwidth Calculation):
 //    - 速度上限 (Mbps) = (bufferSize (字节) / flushTime (毫秒)) * 0.008
-//    - 示例: (512 * 1024 字节 / 10 毫秒) * 0.008 ≈ 419 Mbps
+//    - 示例: (256 * 1024 字节 / 10 毫秒) * 0.008 ≈ 210 Mbps
 //    - 在此模式下，这两个参数共同构成了一个精确的速度限制器。
 // ---------------------------------------------------------------------------------
 /** 下行使用pipe管道开关。true: 启用pipe管道。false: 使用手动循环。*/
@@ -30,10 +30,10 @@ const wsDownloadUserPipe = true; //TCP到Websocket下行
 /** 缓冲发送模式开关。true: 启用缓冲层，聚合发送可降低发送send()调用开销，但是会增加数据转发延迟。false: 不使用缓冲层。*/
 const wsUserBufferer = false;//TCP到Websocket使用缓冲
 /** 缓冲区最大大小。用于计算速度上限。*/
-const bufferSize = 512 * 1024; // 512KB
+const bufferSize = 256 * 1024; // 256KB
 /** 发送调用刷新时间(毫秒)。设定固定的发送频率以控制速度。*/
 /**- **警告**: 设置过低  会因定时器精度和高频创建/销毁开销导致 CPU 负担加重。*/
-const flushTime = 8; // 8ms
+const flushTime = 10; // 10ms
 // ---------------------------------------------------------------------------------
 /** TCPsocket并发获取，可提高tcp连接成功率*/
 const concurrentOnlyDomain = false;//只对域名并发开关
@@ -46,6 +46,7 @@ const proxyStrategyOrder = ['socks', 'http', 'nat64'];
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
 const dohNatEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
 const dohFetchOptions = {method: 'POST', headers: {'content-type': 'application/dns-message'}};
+const workerDnsEarlyDataFastPath = true;
 const proxyIpAddrs = {EU: 'ProxyIP.DE.CMLiussss.net', AS: 'ProxyIP.SG.CMLiussss.net', JP: 'ProxyIP.JP.CMLiussss.net', US: 'ProxyIP.US.CMLiussss.net'};//分区域备用出口
 const finallyProxyHost = 'ProxyIP.CMLiussss.net';//最终兜底出口
 const coloRegions = {
@@ -128,6 +129,9 @@ const isDomainName = (inputStr) => {
 };
 const closeSocketQuietly = (socket) => {
     try {socket?.close()} catch {}
+};
+const closeWebSocketQuietly = (webSocket) => {
+    try {webSocket?.close()} catch {}
 };
 const createConnect = (hostname, port, socket = connect({hostname, port})) => socket.opened.then(() => socket);
 const concurrentConnect = (hostname, port, addrType) => {
@@ -309,6 +313,54 @@ const connectProxyIp = async (param) => {
     const addrType = isDomainName(host) ? 3 : 0;
     return concurrentConnect(host, port, addrType);
 }
+const connectionParamAliases = {
+    gs5: 'gs5', s5all: 'gs5',
+    ghttp: 'ghttp', httpall: 'ghttp',
+    gnat64: 'gnat64', nat64all: 'gnat64',
+    s5: 's5', socks: 's5',
+    http: 'http',
+    ip: 'ip',
+    nat64: 'nat64'
+};
+const parseConnectionParamSegment = (segment, params) => {
+    const lowerSegment = segment.toLowerCase();
+    if (lowerSegment === 'proxyall' || lowerSegment === 'globalproxy' || lowerSegment.startsWith('proxyall=') || lowerSegment.startsWith('globalproxy=')) {
+        params.proxyAll = true;
+        return;
+    }
+    let separatorIndex = segment.indexOf('='), separatorLength = 1;
+    if (separatorIndex === -1) {
+        separatorIndex = lowerSegment.indexOf('://');
+        separatorLength = 3;
+    }
+    if (separatorIndex === -1) {
+        separatorIndex = lowerSegment.indexOf('%3a%2f%2f');
+        separatorLength = 9;
+    }
+    if (separatorIndex === -1) return;
+    const normalizedKey = connectionParamAliases[lowerSegment.substring(0, separatorIndex)];
+    if (!normalizedKey) return;
+    let value = segment.substring(separatorIndex + separatorLength);
+    if (value.endsWith('=')) value = value.slice(0, -1);
+    params[normalizedKey] = value;
+};
+const parseConnectionParams = (requestUrl) => {
+    const pathStart = requestUrl.indexOf('/', 10);
+    if (pathStart === -1) return {proxyAll: false};
+    let rawParams = requestUrl.substring(pathStart + 1);
+    const queryIndex = rawParams.indexOf('?');
+    if (queryIndex !== -1) rawParams = rawParams.substring(queryIndex + 1);
+    if (rawParams.endsWith('/')) rawParams = rawParams.slice(0, -1);
+    if (!rawParams) return {proxyAll: false};
+    const params = {proxyAll: false};
+    let segmentStart = rawParams.charCodeAt(0) === 63 ? 1 : 0;
+    for (let i = segmentStart; i <= rawParams.length; i++) {
+        if (i !== rawParams.length && rawParams.charCodeAt(i) !== 38) continue;
+        if (i > segmentStart) parseConnectionParamSegment(rawParams.substring(segmentStart, i), params);
+        segmentStart = i + 1;
+    }
+    return params;
+};
 const strategyExecutorMap = new Map([
     [0, async ({addrType, port, targetAddrBytes}) => {
         const hostname = binaryAddrToString(addrType, targetAddrBytes);
@@ -333,52 +385,57 @@ const strategyExecutorMap = new Map([
         return connectNat64(addrType, port, nat64Auth, targetAddrBytes, proxyAll);
     }]
 ]);
-const paramRegex = /(gs5|s5all|ghttp|gnat64|nat64all|httpall|s5|socks|http|ip|nat64)(?:=|:\/\/|%3A%2F%2F)([^&]+)|(proxyall|globalproxy)/gi;
-const establishTcpConnection = async (parsedRequest, request) => {
-    const url = request.url.substring(request.url.indexOf('/', 10) + 1);
-    const cleanUrl = url.endsWith('/') ? url.slice(0, -1) : url;
-    const params = new Map();
-    let match;
-    while ((match = paramRegex.exec(cleanUrl)) !== null) {
-        if (match[1] && match[2]) {
-            params.set(match[1].toLowerCase(), match[2].endsWith('=') ? match[2].slice(0, -1) : match[2]);
-        } else if (match[3]) {params.set(match[3].toLowerCase(), true)}
-    }
-    const gs5Param = params.get('gs5') ?? params.get('s5all');
-    const ghttpParam = params.get('ghttp') ?? params.get('httpall');
-    const gnat64Param = params.get('gnat64') ?? params.get('nat64all');
-    const socksParam = gs5Param ?? params.get('s5') ?? params.get('socks');
-    const httpParam = ghttpParam ?? params.get('http');
-    const nat64Param = gnat64Param ?? params.get('nat64');
-    const proxyAll = !!(gs5Param || ghttpParam || gnat64Param || params.has('proxyall') || params.has('globalproxy'));
-    const strategyMap = {
-        socks: socksParam ? decodeURIComponent(socksParam).split(',').filter(Boolean).map(p => ({type: 1, param: p.trim()})) : [],
-        http: httpParam ? decodeURIComponent(httpParam).split(',').filter(Boolean).map(p => ({type: 2, param: p.trim()})) : [],
-        nat64: nat64Param ? decodeURIComponent(nat64Param).split(',').filter(Boolean).map(p => ({type: 5, param: {nat64Auth: p.trim(), proxyAll: proxyAll}})) : []
-    };
-    const orderedProxyStrategies = proxyStrategyOrder.flatMap(key => strategyMap[key]);
-    let strategies = [];
-    if (proxyAll) {
-        strategies.push(...orderedProxyStrategies);
-        if (strategies.length === 0) strategies.push({type: 0});
-    } else {
-        const ipParam = params.get('ip');
-        const proxyIpSources = [
-            ...(ipParam ? decodeURIComponent(ipParam).split(',').filter(Boolean).map(p => p.trim()) : []),
-            coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US
-        ];
-        const proxyIpStrategies = proxyIpSources.map(ipString => {return {type: 3, param: ipString}});
-        strategies = [{type: 0}, ...orderedProxyStrategies, ...proxyIpStrategies, {type: 4}];
-    }
-    for (const strategy of strategies) {
-        const executor = strategyExecutorMap.get(strategy.type);
-        if (!executor) continue;
-        try {
-            const tcpSocket = await executor(parsedRequest, strategy.param);
-            if (tcpSocket) return tcpSocket;
-        } catch {}
+const executeStrategy = async (parsedRequest, type, param) => {
+    const executor = strategyExecutorMap.get(type);
+    if (!executor) return null;
+    try {return await executor(parsedRequest, param)} catch {return null}
+};
+const executeDecodedParamStrategies = async (parsedRequest, type, rawParam, transformParam = value => value) => {
+    if (!rawParam) return null;
+    const decodedParam = decodeURIComponent(rawParam);
+    let itemStart = 0;
+    for (let i = 0; i <= decodedParam.length; i++) {
+        if (i !== decodedParam.length && decodedParam.charCodeAt(i) !== 44) continue;
+        const value = decodedParam.substring(itemStart, i).trim();
+        itemStart = i + 1;
+        if (!value) continue;
+        const tcpSocket = await executeStrategy(parsedRequest, type, transformParam(value));
+        if (tcpSocket) return tcpSocket;
     }
     return null;
+};
+const establishTcpConnection = async (parsedRequest, request) => {
+    const params = parseConnectionParams(request.url);
+    const socksParam = params.gs5 ?? params.s5;
+    const httpParam = params.ghttp ?? params.http;
+    const nat64Param = params.gnat64 ?? params.nat64;
+    const proxyAll = !!(params.proxyAll || params.gs5 || params.ghttp || params.gnat64);
+    if (!proxyAll) {
+        const directSocket = await executeStrategy(parsedRequest, 0);
+        if (directSocket) return directSocket;
+    }
+    let hasProxyStrategy = false;
+    for (const strategyKey of proxyStrategyOrder) {
+        if (strategyKey === 'socks' && socksParam) {
+            hasProxyStrategy = true;
+            const tcpSocket = await executeDecodedParamStrategies(parsedRequest, 1, socksParam);
+            if (tcpSocket) return tcpSocket;
+        } else if (strategyKey === 'http' && httpParam) {
+            hasProxyStrategy = true;
+            const tcpSocket = await executeDecodedParamStrategies(parsedRequest, 2, httpParam);
+            if (tcpSocket) return tcpSocket;
+        } else if (strategyKey === 'nat64' && nat64Param) {
+            hasProxyStrategy = true;
+            const tcpSocket = await executeDecodedParamStrategies(parsedRequest, 5, nat64Param, nat64Auth => ({nat64Auth, proxyAll}));
+            if (tcpSocket) return tcpSocket;
+        }
+    }
+    if (proxyAll) return hasProxyStrategy ? null : executeStrategy(parsedRequest, 0);
+    const proxyIpSocket = await executeDecodedParamStrategies(parsedRequest, 3, params.ip);
+    if (proxyIpSocket) return proxyIpSocket;
+    const regionalProxySocket = await executeStrategy(parsedRequest, 3, coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US);
+    if (regionalProxySocket) return regionalProxySocket;
+    return executeStrategy(parsedRequest, 4);
 };
 const dohDnsHandler = async (payload) => {
     if (payload.byteLength < 2) throw new Error();
@@ -398,6 +455,15 @@ const dohDnsHandler = async (payload) => {
     return packet;
 };
 const safeBufferSize = bufferSize - 4096;
+const getWebSocketEarlyData = (request) => {
+    const protocolHeader = request.headers.get('sec-websocket-protocol');
+    if (!protocolHeader) return null;
+    try {
+        // @ts-ignore
+        return Uint8Array.fromBase64(protocolHeader, {alphabet: 'base64url'});
+    } catch {return null}
+};
+const normalizeWsChunk = (chunk) => chunk instanceof Uint8Array ? chunk : typeof chunk === 'string' ? textEncoder.encode(chunk) : new Uint8Array(chunk);
 const streamPipe = (initialChunk) => {
     let buffer = new Uint8Array(bufferSize), offset = 0, timerId = null, resume = null;
     const flushBuffer = (controller) => {
@@ -460,15 +526,12 @@ const manualPipe = async (readable, writable, initialChunk, userCache) => {
         }
     } finally {flushBuffer(), reader.releaseLock()}
 };
-const handleWebSocketConn = async (webSocket, request) => {
-    const protocolHeader = request.headers.get('sec-websocket-protocol');
-    // @ts-ignore
-    const earlyData = protocolHeader ? Uint8Array.fromBase64(protocolHeader, {alphabet: 'base64url'}) : null;
+const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketEarlyData(request)) => {
     let streamClosed = false;
     const webSocketStream = new ReadableStream({
         start(controller) {
             if (earlyData) controller.enqueue(earlyData);
-            webSocket.addEventListener("message", event => controller.enqueue(event.data));
+            webSocket.addEventListener("message", event => controller.enqueue(normalizeWsChunk(event.data)));
             webSocket.addEventListener("close", () => {
                 if (streamClosed) return;
                 streamClosed = true;
@@ -482,12 +545,18 @@ const handleWebSocketConn = async (webSocket, request) => {
         },
         cancel() {webSocket.close()}
     });
-    let messageHandler, tcpSocket;
-    const closeSocket = () => {tcpSocket?.close(), webSocket?.close()};
+    let messageHandler, tcpSocket, tcpWriter;
+    const closeSocket = () => {
+        messageHandler = null;
+        try {tcpWriter?.releaseLock()} catch {}
+        tcpWriter = null;
+        closeSocketQuietly(tcpSocket);
+        tcpSocket = null;
+        closeWebSocketQuietly(webSocket);
+    };
     webSocketStream.pipeTo(new WritableStream({
         async write(chunk) {
             if (messageHandler) return messageHandler(chunk);
-            chunk = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
             let parsedRequest;
             if ((parsedRequest = parseRequestData(chunk))) {
                 webSocket.send(new Uint8Array([chunk[0], 0]));
@@ -500,18 +569,25 @@ const handleWebSocketConn = async (webSocket, request) => {
             } else {
                 tcpSocket = await establishTcpConnection(parsedRequest, request);
                 if (!tcpSocket) throw new Error();
-                const tcpWriter = tcpSocket.writable.getWriter();
+                tcpWriter = tcpSocket.writable.getWriter();
                 if (payload.byteLength) await tcpWriter.write(payload);
-                messageHandler = (chunk) => tcpWriter.write(chunk);
+                messageHandler = tcpWriter.write.bind(tcpWriter);
                 if (wsDownloadUserPipe) {
                     const streamChain = wsUserBufferer ? tcpSocket.readable.pipeThrough(streamPipe()) : tcpSocket.readable;
-                    streamChain.pipeTo(new WritableStream({write(chunk) {webSocket.send(chunk)}}));
-                } else {manualPipe(tcpSocket.readable, webSocket, null, wsUserBufferer)}
+                    streamChain.pipeTo(new WritableStream({write(chunk) {webSocket.send(chunk)}})).catch(() => closeSocket()).finally(() => closeSocket());
+                } else {
+                    manualPipe(tcpSocket.readable, webSocket, null, wsUserBufferer).catch(() => closeSocket()).finally(() => closeSocket());
+                }
             }
         }
     })).catch(() => closeSocket()).finally(() => closeSocket());
 };
 const isWebSocketUpgrade = (request) => request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+const shouldHandleDnsInWorker = (request, env, earlyData = getWebSocketEarlyData(request)) => {
+    if (!workerDnsEarlyDataFastPath || !env?.HEAVY_DO || !isWebSocketUpgrade(request) || !earlyData?.byteLength) return false;
+    const parsedRequest = parseRequestData(earlyData);
+    return !!parsedRequest?.isDns;
+};
 const getConfiguredHeavyDoShardCount = (env) => {
     const rawValue = Number.parseInt(env?.HEAVY_DO_SHARDS ?? `${heavyDoShardCount}`, 10);
     if (!Number.isFinite(rawValue)) return heavyDoShardCount;
@@ -533,11 +609,11 @@ const routeToHeavyDo = (request, env) => {
     const id = env.HEAVY_DO.idFromName(getHeavyDoName(request, env));
     return env.HEAVY_DO.get(id).fetch(request);
 };
-const handleRequest = (request) => {
+const handleRequest = (request, earlyData = getWebSocketEarlyData(request)) => {
     if (isWebSocketUpgrade(request)) {
         const {0: clientSocket, 1: webSocket} = new WebSocketPair();
         webSocket.accept();
-        handleWebSocketConn(webSocket, request);
+        handleWebSocketConn(webSocket, request, earlyData);
         return new Response(null, {status: 101, webSocket: clientSocket});
     }
     return new Response(html, {status: 404, headers: {'Content-Type': 'text/html; charset=UTF-8'}});
@@ -549,7 +625,9 @@ export class HeavyDo extends DurableObject {
 }
 export default {
     async fetch(request, env) {
+        const earlyData = isWebSocketUpgrade(request) ? getWebSocketEarlyData(request) : null;
+        if (shouldHandleDnsInWorker(request, env, earlyData)) return handleRequest(request, earlyData);
         if (shouldOffloadToHeavyDo(request, env)) return routeToHeavyDo(request, env);
-        return handleRequest(request);
+        return handleRequest(request, earlyData);
     }
 };
