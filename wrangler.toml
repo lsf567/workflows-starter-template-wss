@@ -10,3 +10,6 @@ class_name = "HeavyDo"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["HeavyDo"]
+
+[observability]
+enabled = true
