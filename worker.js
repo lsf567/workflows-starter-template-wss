@@ -313,16 +313,6 @@ const connectProxyIp = async (param) => {
     const addrType = isDomainName(host) ? 3 : 0;
     return concurrentConnect(host, port, addrType);
 }
-const emptyParamList = Object.freeze([]);
-const emptyConnectionConfig = Object.freeze({
-    proxyAll: false,
-    socksList: emptyParamList,
-    httpList: emptyParamList,
-    nat64List: emptyParamList,
-    ipList: emptyParamList
-});
-const connectionConfigCache = new Map();
-const maxConnectionConfigCacheSize = 32;
 const connectionParamAliases = {
     gs5: 'gs5', s5all: 'gs5',
     ghttp: 'ghttp', httpall: 'ghttp',
@@ -354,27 +344,14 @@ const parseConnectionParamSegment = (segment, params) => {
     if (value.endsWith('=')) value = value.slice(0, -1);
     params[normalizedKey] = value;
 };
-const parseConnectionParamList = (rawParam) => {
-    if (!rawParam) return emptyParamList;
-    const decodedParam = decodeURIComponent(rawParam);
-    const values = [];
-    let itemStart = 0;
-    for (let i = 0; i <= decodedParam.length; i++) {
-        if (i !== decodedParam.length && decodedParam.charCodeAt(i) !== 44) continue;
-        const value = decodedParam.substring(itemStart, i).trim();
-        itemStart = i + 1;
-        value && values.push(value);
-    }
-    return values.length ? values : emptyParamList;
-};
-const parseConnectionConfig = (requestUrl) => {
+const parseConnectionParams = (requestUrl) => {
     const pathStart = requestUrl.indexOf('/', 10);
-    if (pathStart === -1 || pathStart === requestUrl.length - 1) return emptyConnectionConfig;
+    if (pathStart === -1) return {proxyAll: false};
     let rawParams = requestUrl.substring(pathStart + 1);
     const queryIndex = rawParams.indexOf('?');
     if (queryIndex !== -1) rawParams = rawParams.substring(queryIndex + 1);
     if (rawParams.endsWith('/')) rawParams = rawParams.slice(0, -1);
-    if (!rawParams) return emptyConnectionConfig;
+    if (!rawParams) return {proxyAll: false};
     const params = {proxyAll: false};
     let segmentStart = rawParams.charCodeAt(0) === 63 ? 1 : 0;
     for (let i = segmentStart; i <= rawParams.length; i++) {
@@ -382,83 +359,79 @@ const parseConnectionConfig = (requestUrl) => {
         if (i > segmentStart) parseConnectionParamSegment(rawParams.substring(segmentStart, i), params);
         segmentStart = i + 1;
     }
-    const socksList = parseConnectionParamList(params.gs5 ?? params.s5);
-    const httpList = parseConnectionParamList(params.ghttp ?? params.http);
-    const nat64List = parseConnectionParamList(params.gnat64 ?? params.nat64);
-    const ipList = parseConnectionParamList(params.ip);
-    const proxyAll = !!(params.proxyAll || params.gs5 || params.ghttp || params.gnat64);
-    if (!proxyAll && socksList === emptyParamList && httpList === emptyParamList && nat64List === emptyParamList && ipList === emptyParamList) return emptyConnectionConfig;
-    return {proxyAll, socksList, httpList, nat64List, ipList};
+    return params;
 };
-const getConnectionConfig = (requestUrl) => {
-    const cachedConfig = connectionConfigCache.get(requestUrl);
-    if (cachedConfig) return cachedConfig;
-    const config = parseConnectionConfig(requestUrl);
-    if (connectionConfigCache.size >= maxConnectionConfigCacheSize) connectionConfigCache.delete(connectionConfigCache.keys().next().value);
-    connectionConfigCache.set(requestUrl, config);
-    return config;
-};
-const strategyExecutors = [
-    async ({addrType, port, targetAddrBytes}) => {
+const strategyExecutorMap = new Map([
+    [0, async ({addrType, port, targetAddrBytes}) => {
         const hostname = binaryAddrToString(addrType, targetAddrBytes);
         return concurrentConnect(hostname, port, addrType);
-    },
-    async ({addrType, port, targetAddrBytes}, param) => {
+    }],
+    [1, async ({addrType, port, targetAddrBytes}, param) => {
         const socksAuth = parseAuthString(param);
         return connectViaSocksProxy(addrType, port, socksAuth, targetAddrBytes);
-    },
-    async ({addrType, port, targetAddrBytes}, param) => {
+    }],
+    [2, async ({addrType, port, targetAddrBytes}, param) => {
         const httpAuth = parseAuthString(param);
         return connectViaHttpProxy(addrType, port, httpAuth, targetAddrBytes);
-    },
-    async (_parsedRequest, param) => {
+    }],
+    [3, async (_parsedRequest, param) => {
         return connectProxyIp(param);
-    },
-    async (_parsedRequest, _param) => {
+    }],
+    [4, async (_parsedRequest, _param) => {
         return concurrentConnect(finallyProxyHost, 443, 3);
-    },
-    async ({addrType, port, targetAddrBytes}, param) => {
+    }],
+    [5, async ({addrType, port, targetAddrBytes}, param) => {
         const {nat64Auth, proxyAll} = param;
         return connectNat64(addrType, port, nat64Auth, targetAddrBytes, proxyAll);
-    }
-];
+    }]
+]);
 const executeStrategy = async (parsedRequest, type, param) => {
-    const executor = strategyExecutors[type];
+    const executor = strategyExecutorMap.get(type);
     if (!executor) return null;
     try {return await executor(parsedRequest, param)} catch {return null}
 };
-const executeStrategyList = async (parsedRequest, type, values, transformParam = value => value) => {
-    for (const value of values) {
+const executeDecodedParamStrategies = async (parsedRequest, type, rawParam, transformParam = value => value) => {
+    if (!rawParam) return null;
+    const decodedParam = decodeURIComponent(rawParam);
+    let itemStart = 0;
+    for (let i = 0; i <= decodedParam.length; i++) {
+        if (i !== decodedParam.length && decodedParam.charCodeAt(i) !== 44) continue;
+        const value = decodedParam.substring(itemStart, i).trim();
+        itemStart = i + 1;
+        if (!value) continue;
         const tcpSocket = await executeStrategy(parsedRequest, type, transformParam(value));
         if (tcpSocket) return tcpSocket;
     }
     return null;
 };
 const establishTcpConnection = async (parsedRequest, request) => {
-    const connectionConfig = getConnectionConfig(request.url);
-    const {proxyAll, socksList, httpList, nat64List, ipList} = connectionConfig;
+    const params = parseConnectionParams(request.url);
+    const socksParam = params.gs5 ?? params.s5;
+    const httpParam = params.ghttp ?? params.http;
+    const nat64Param = params.gnat64 ?? params.nat64;
+    const proxyAll = !!(params.proxyAll || params.gs5 || params.ghttp || params.gnat64);
     if (!proxyAll) {
         const directSocket = await executeStrategy(parsedRequest, 0);
         if (directSocket) return directSocket;
     }
     let hasProxyStrategy = false;
     for (const strategyKey of proxyStrategyOrder) {
-        if (strategyKey === 'socks' && socksList.length) {
+        if (strategyKey === 'socks' && socksParam) {
             hasProxyStrategy = true;
-            const tcpSocket = await executeStrategyList(parsedRequest, 1, socksList);
+            const tcpSocket = await executeDecodedParamStrategies(parsedRequest, 1, socksParam);
             if (tcpSocket) return tcpSocket;
-        } else if (strategyKey === 'http' && httpList.length) {
+        } else if (strategyKey === 'http' && httpParam) {
             hasProxyStrategy = true;
-            const tcpSocket = await executeStrategyList(parsedRequest, 2, httpList);
+            const tcpSocket = await executeDecodedParamStrategies(parsedRequest, 2, httpParam);
             if (tcpSocket) return tcpSocket;
-        } else if (strategyKey === 'nat64' && nat64List.length) {
+        } else if (strategyKey === 'nat64' && nat64Param) {
             hasProxyStrategy = true;
-            const tcpSocket = await executeStrategyList(parsedRequest, 5, nat64List, nat64Auth => ({nat64Auth, proxyAll}));
+            const tcpSocket = await executeDecodedParamStrategies(parsedRequest, 5, nat64Param, nat64Auth => ({nat64Auth, proxyAll}));
             if (tcpSocket) return tcpSocket;
         }
     }
     if (proxyAll) return hasProxyStrategy ? null : executeStrategy(parsedRequest, 0);
-    const proxyIpSocket = await executeStrategyList(parsedRequest, 3, ipList);
+    const proxyIpSocket = await executeDecodedParamStrategies(parsedRequest, 3, params.ip);
     if (proxyIpSocket) return proxyIpSocket;
     const regionalProxySocket = await executeStrategy(parsedRequest, 3, coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US);
     if (regionalProxySocket) return regionalProxySocket;
@@ -554,65 +527,60 @@ const manualPipe = async (readable, writable, initialChunk, userCache) => {
     } finally {flushBuffer(), reader.releaseLock()}
 };
 const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketEarlyData(request)) => {
-    let closed = false, tcpSocket, tcpWriter, uploadHandler, uploadChain = Promise.resolve();
-    let messageListener, closeListener, errorListener;
-    const detachWebSocketListeners = () => {
-        try {messageListener && webSocket.removeEventListener('message', messageListener)} catch {}
-        try {closeListener && webSocket.removeEventListener('close', closeListener)} catch {}
-        try {errorListener && webSocket.removeEventListener('error', errorListener)} catch {}
-        messageListener = closeListener = errorListener = null;
-    };
+    let streamClosed = false;
+    const webSocketStream = new ReadableStream({
+        start(controller) {
+            if (earlyData) controller.enqueue(earlyData);
+            webSocket.addEventListener("message", event => controller.enqueue(normalizeWsChunk(event.data)));
+            webSocket.addEventListener("close", () => {
+                if (streamClosed) return;
+                streamClosed = true;
+                controller.close();
+            });
+            webSocket.addEventListener("error", () => {
+                if (streamClosed) return;
+                streamClosed = true;
+                controller.error(new Error('websocket error'));
+            });
+        },
+        cancel() {webSocket.close()}
+    });
+    let messageHandler, tcpSocket, tcpWriter;
     const closeSocket = () => {
-        if (closed) return;
-        closed = true;
-        uploadHandler = null;
-        detachWebSocketListeners();
+        messageHandler = null;
         try {tcpWriter?.releaseLock()} catch {}
         tcpWriter = null;
         closeSocketQuietly(tcpSocket);
         tcpSocket = null;
         closeWebSocketQuietly(webSocket);
     };
-    const startTcpDownload = () => {
-        if (wsDownloadUserPipe) {
-            const streamChain = wsUserBufferer ? tcpSocket.readable.pipeThrough(streamPipe()) : tcpSocket.readable;
-            streamChain.pipeTo(new WritableStream({write(chunk) {webSocket.send(chunk)}})).catch(() => closeSocket()).finally(() => closeSocket());
-            return;
+    webSocketStream.pipeTo(new WritableStream({
+        async write(chunk) {
+            if (messageHandler) return messageHandler(chunk);
+            let parsedRequest;
+            if ((parsedRequest = parseRequestData(chunk))) {
+                webSocket.send(new Uint8Array([chunk[0], 0]));
+            }
+            if (!parsedRequest) throw new Error();
+            const payload = chunk.subarray(parsedRequest.dataOffset);
+            if (parsedRequest.isDns) {
+                webSocket.send(await dohDnsHandler(payload));
+                webSocket.close();
+            } else {
+                tcpSocket = await establishTcpConnection(parsedRequest, request);
+                if (!tcpSocket) throw new Error();
+                tcpWriter = tcpSocket.writable.getWriter();
+                if (payload.byteLength) await tcpWriter.write(payload);
+                messageHandler = tcpWriter.write.bind(tcpWriter);
+                if (wsDownloadUserPipe) {
+                    const streamChain = wsUserBufferer ? tcpSocket.readable.pipeThrough(streamPipe()) : tcpSocket.readable;
+                    streamChain.pipeTo(new WritableStream({write(chunk) {webSocket.send(chunk)}})).catch(() => closeSocket()).finally(() => closeSocket());
+                } else {
+                    manualPipe(tcpSocket.readable, webSocket, null, wsUserBufferer).catch(() => closeSocket()).finally(() => closeSocket());
+                }
+            }
         }
-        manualPipe(tcpSocket.readable, webSocket, null, wsUserBufferer).catch(() => closeSocket()).finally(() => closeSocket());
-    };
-    const handleInitialChunk = async (chunk) => {
-        let parsedRequest;
-        if ((parsedRequest = parseRequestData(chunk))) webSocket.send(new Uint8Array([chunk[0], 0]));
-        if (!parsedRequest) throw new Error();
-        const payload = chunk.subarray(parsedRequest.dataOffset);
-        if (parsedRequest.isDns) {
-            webSocket.send(await dohDnsHandler(payload));
-            closeSocket();
-            return;
-        }
-        tcpSocket = await establishTcpConnection(parsedRequest, request);
-        if (!tcpSocket) throw new Error();
-        tcpWriter = tcpSocket.writable.getWriter();
-        if (payload.byteLength) await tcpWriter.write(payload);
-        uploadHandler = chunk => tcpWriter.write(chunk);
-        startTcpDownload();
-    };
-    uploadHandler = handleInitialChunk;
-    const scheduleUpload = (chunk) => {
-        if (closed) return;
-        uploadChain = uploadChain.then(() => {
-            if (closed || !uploadHandler) return;
-            return uploadHandler(chunk);
-        }).catch(() => closeSocket());
-    };
-    messageListener = event => scheduleUpload(normalizeWsChunk(event.data));
-    closeListener = () => closeSocket();
-    errorListener = () => closeSocket();
-    webSocket.addEventListener('message', messageListener);
-    webSocket.addEventListener('close', closeListener);
-    webSocket.addEventListener('error', errorListener);
-    if (earlyData?.byteLength) scheduleUpload(earlyData);
+    })).catch(() => closeSocket()).finally(() => closeSocket());
 };
 const isWebSocketUpgrade = (request) => request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 const shouldHandleDnsInWorker = (request, env, earlyData = getWebSocketEarlyData(request)) => {
