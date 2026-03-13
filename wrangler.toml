@@ -1,0 +1,11 @@
+name = "workflows-starter-template-wss"
+main = "worker.js"
+compatibility_date = "2026-03-13"
+
+[[durable_objects.bindings]]
+name = "HEAVY_DO"
+class_name = "HeavyDo"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HeavyDo"]
