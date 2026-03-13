@@ -17,7 +17,8 @@
 import {DurableObject} from 'cloudflare:workers';
 import {connect} from 'cloudflare:sockets';
 const uuid = '374b719e-1487-49ac-8303-1697301950d6';//vless使用的uuid
-const heavyDoShardCount = 1;//免费版建议保持1，避免每条连接独占一个DO导致GB-sec暴涨
+const heavyDoShardCount = 1;//默认分片数，免费版建议保持1，避免每条连接独占一个DO导致GB-sec暴涨
+const maxHeavyDoShardCount = 4;
 // ---------------------------------------------------------------------------------
 // 理论最大带宽计算公式 (Theoretical Max Bandwidth Calculation):
 //    - 速度上限 (Mbps) = (bufferSize (字节) / flushTime (毫秒)) * 0.008
@@ -219,8 +220,10 @@ const parseAddress = (buffer, offset, addrType) => {
     return {targetAddrBytes, dataOffset: newOffset};
 };
 const parseRequestData = (firstChunk) => {
+    if (firstChunk.length < 24) return null;
     for (let i = 0; i < 16; i++) if (firstChunk[i + 1] !== uuidBytes[i]) return null;
     let offset = 19 + firstChunk[17];
+    if (offset + 3 > firstChunk.length) return null;
     const port = (firstChunk[offset] << 8) | firstChunk[offset + 1];
     let addrType = firstChunk[offset + 2];
     if (addrType !== 1) addrType += 1;
@@ -443,10 +446,21 @@ const handleWebSocketConn = async (webSocket, request) => {
     const protocolHeader = request.headers.get('sec-websocket-protocol');
     // @ts-ignore
     const earlyData = protocolHeader ? Uint8Array.fromBase64(protocolHeader, {alphabet: 'base64url'}) : null;
+    let streamClosed = false;
     const webSocketStream = new ReadableStream({
         start(controller) {
             if (earlyData) controller.enqueue(earlyData);
             webSocket.addEventListener("message", event => controller.enqueue(event.data));
+            webSocket.addEventListener("close", () => {
+                if (streamClosed) return;
+                streamClosed = true;
+                controller.close();
+            });
+            webSocket.addEventListener("error", () => {
+                if (streamClosed) return;
+                streamClosed = true;
+                controller.error(new Error('websocket error'));
+            });
         },
         cancel() {webSocket.close()}
     });
@@ -464,7 +478,7 @@ const handleWebSocketConn = async (webSocket, request) => {
             const payload = chunk.subarray(parsedRequest.dataOffset);
             if (parsedRequest.isDns) {
                 webSocket.send(await dohDnsHandler(payload));
-                if (!earlyData) webSocket.close();
+                webSocket.close();
             } else {
                 tcpSocket = await establishTcpConnection(parsedRequest, request);
                 if (!tcpSocket) throw new Error();
@@ -480,19 +494,25 @@ const handleWebSocketConn = async (webSocket, request) => {
     })).catch(() => closeSocket()).finally(() => closeSocket());
 };
 const isWebSocketUpgrade = (request) => request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+const getConfiguredHeavyDoShardCount = (env) => {
+    const rawValue = Number.parseInt(env?.HEAVY_DO_SHARDS ?? `${heavyDoShardCount}`, 10);
+    if (!Number.isFinite(rawValue)) return heavyDoShardCount;
+    return Math.min(maxHeavyDoShardCount, Math.max(1, rawValue));
+};
 const hashString = (input) => {
     let hash = 0;
     for (let i = 0; i < input.length; i++) hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
     return hash;
 };
-const getHeavyDoName = (request) => {
-    if (heavyDoShardCount <= 1) return 'singleton';
+const getHeavyDoName = (request, env) => {
+    const shardCount = getConfiguredHeavyDoShardCount(env);
+    if (shardCount <= 1) return 'singleton';
     const clientKey = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || request.headers.get('sec-websocket-key') || 'default';
-    return `shard:${hashString(clientKey) % heavyDoShardCount}`;
+    return `shard:${hashString(clientKey) % shardCount}`;
 };
 const shouldOffloadToHeavyDo = (request, env) => !!env?.HEAVY_DO && isWebSocketUpgrade(request);
 const routeToHeavyDo = (request, env) => {
-    const id = env.HEAVY_DO.idFromName(getHeavyDoName(request));
+    const id = env.HEAVY_DO.idFromName(getHeavyDoName(request, env));
     return env.HEAVY_DO.get(id).fetch(request);
 };
 const handleRequest = (request) => {
