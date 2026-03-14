@@ -95,6 +95,10 @@ const logError = (context, error) => {
     const details = error?.stack || error?.message || `${error ?? ''}`;
     console.error(`[worker] ${context}${details ? `: ${details}` : ''}`);
 };
+const isExpectedStreamCancel = (error) => {
+    const message = error?.message || `${error ?? ''}`;
+    return message.includes('Stream was cancelled');
+};
 const concatUint8Arrays = (left, right) => {
     const combined = new Uint8Array(left.length + right.length);
     combined.set(left);
@@ -365,7 +369,7 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
                     sendToClient(value);
                 }
             } catch (error) {
-                logError('tcp readable failed', error);
+                if (!tcpState.closed && !isExpectedStreamCancel(error)) logError('tcp readable failed', error);
             } finally {
                 try {tcpState.reader.releaseLock()} catch {}
                 if (activeTcpState === tcpState) activeTcpState = null;
