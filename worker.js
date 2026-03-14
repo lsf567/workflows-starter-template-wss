@@ -91,6 +91,10 @@ const closeSocketQuietly = (socket) => {
 const closeWebSocketQuietly = (webSocket) => {
     try {webSocket?.close()} catch {}
 };
+const logError = (context, error) => {
+    const details = error?.stack || error?.message || `${error ?? ''}`;
+    console.error(`[worker] ${context}${details ? `: ${details}` : ''}`);
+};
 const concatUint8Arrays = (left, right) => {
     const combined = new Uint8Array(left.length + right.length);
     combined.set(left);
@@ -305,6 +309,8 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
     let nextConnectAttemptIndex = 0;
     let connectAttempts = null;
     let clientWriteCommitted = false;
+    let responseHeader = null;
+    let responseHeaderSent = false;
     const webSocketStream = new ReadableStream({
         start(controller) {
             if (earlyData) controller.enqueue(earlyData);
@@ -329,6 +335,15 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
         try {tcpState.writer?.releaseLock()} catch {}
         closeSocketQuietly(tcpState.socket);
     };
+    const sendResponseHeader = () => {
+        if (responseHeaderSent || !responseHeader) return;
+        webSocket.send(responseHeader);
+        responseHeaderSent = true;
+    };
+    const sendToClient = (chunk) => {
+        sendResponseHeader();
+        if (chunk?.byteLength) webSocket.send(chunk);
+    };
     const closeConnection = () => {
         messageHandler = null;
         const tcpState = activeTcpState;
@@ -347,9 +362,11 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
                     if (!tcpState.hasRemoteData) {
                         tcpState.hasRemoteData = true;
                     }
-                    webSocket.send(value);
+                    sendToClient(value);
                 }
-            } catch {} finally {
+            } catch (error) {
+                logError('tcp readable failed', error);
+            } finally {
                 try {tcpState.reader.releaseLock()} catch {}
                 if (activeTcpState === tcpState) activeTcpState = null;
                 if (tcpState.closed) return;
@@ -410,19 +427,23 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
             if (parseResult.status !== 'ok') throw new Error();
             pendingFirstChunk = null;
             const {parsedRequest} = parseResult;
-            webSocket.send(new Uint8Array([firstChunk[0], 0]));
+            responseHeader = new Uint8Array([firstChunk[0], 0]);
             const payload = firstChunk.subarray(parsedRequest.dataOffset);
             if (parsedRequest.isDns) {
-                webSocket.send(await dohDnsHandler(payload));
+                sendToClient(await dohDnsHandler(payload));
                 webSocket.close();
             } else {
                 connectAttempts = buildTcpConnectAttempts(parsedRequest, request);
                 if (!await openNextTcpState()) throw new Error();
                 if (payload.byteLength) await writeToTcp(payload);
+                sendResponseHeader();
                 messageHandler = writeToTcp;
             }
         }
-    })).catch(() => closeConnection()).finally(() => closeConnection());
+    })).catch(error => {
+        logError('websocket pipeline failed', error);
+        closeConnection();
+    }).finally(() => closeConnection());
 };
 const isWebSocketUpgrade = (request) => request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 const shouldHandleDnsInWorker = (request, env, earlyData = getWebSocketEarlyData(request)) => {
