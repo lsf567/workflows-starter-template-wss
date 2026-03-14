@@ -22,10 +22,9 @@ const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.googl
 const dohJsonEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
 const dohFetchOptions = {method: 'POST', headers: {'content-type': 'application/dns-message'}};
 const workerDnsEarlyDataFastPath = true;
-const proxyIpAddrs = {EU: 'ProxyIP.DE.CMLiussss.net', AS: 'ProxyIP.JP.CMLiussss.net', JP: 'ProxyIP.JP.CMLiussss.net', US: 'ProxyIP.US.CMLiussss.net'};//分区域备用出口
+const proxyIpAddrs = {EU: 'ProxyIP.DE.CMLiussss.net', AS: 'ProxyIP.JP.CMLiussss.net', US: 'ProxyIP.US.CMLiussss.net'};//分区域备用出口
 const finallyProxyHost = 'ProxyIP.CMLiussss.net';//最终兜底出口
 const coloRegions = {
-    JP: new Set(['FUK', 'ICN', 'KIX', 'NRT', 'OKA']),
     EU: new Set([
         'ACC', 'ADB', 'ALA', 'ALG', 'AMM', 'AMS', 'ARN', 'ATH', 'BAH', 'BCN', 'BEG', 'BGW', 'BOD', 'BRU', 'BTS', 'BUD', 'CAI',
         'CDG', 'CPH', 'CPT', 'DAR', 'DKR', 'DMM', 'DOH', 'DUB', 'DUR', 'DUS', 'DXB', 'EBB', 'EDI', 'EVN', 'FCO', 'FRA', 'GOT',
@@ -33,9 +32,9 @@ const coloRegions = {
         'LYS', 'MAD', 'MAN', 'MCT', 'MPM', 'MRS', 'MUC', 'MXP', 'NBO', 'OSL', 'OTP', 'PMO', 'PRG', 'RIX', 'RUH', 'RUN', 'SKG',
         'SOF', 'STR', 'TBS', 'TLL', 'TLV', 'TUN', 'VIE', 'VNO', 'WAW', 'ZAG', 'ZRH']),
     AS: new Set([
-        'ADL', 'AKL', 'AMD', 'BKK', 'BLR', 'BNE', 'BOM', 'CBR', 'CCU', 'CEB', 'CGK', 'CMB', 'COK', 'DAC', 'DEL', 'HAN', 'HKG',
+        'ADL', 'AKL', 'AMD', 'BKK', 'BLR', 'BNE', 'BOM', 'CBR', 'CCU', 'CEB', 'CGK', 'CMB', 'COK', 'DAC', 'DEL', 'FUK', 'HAN', 'HKG',
         'HYD', 'ISB', 'JHB', 'JOG', 'KCH', 'KHH', 'KHI', 'KTM', 'KUL', 'LHE', 'MAA', 'MEL', 'MFM', 'MLE', 'MNL', 'NAG', 'NOU',
-        'PAT', 'PBH', 'PER', 'PNH', 'SGN', 'SIN', 'SYD', 'TPE', 'ULN', 'VTE'])
+        'PAT', 'PBH', 'PER', 'PNH', 'SGN', 'SIN', 'SYD', 'TPE', 'ULN', 'VTE', 'ICN', 'KIX', 'NRT', 'OKA'])
 };
 const coloToProxyMap = new Map(Object.entries(coloRegions).flatMap(([region, colos]) => Array.from(colos, colo => [colo, proxyIpAddrs[region]])));
 const uuidBytes = new Uint8Array(16), offsets = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4, 4];
@@ -314,6 +313,8 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
     let activeTcpState = null;
     let nextConnectAttemptIndex = 0;
     let connectAttempts = null;
+    let clientWriteStarted = false;
+    let clientWriteCommitted = false;
     const webSocketStream = new ReadableStream({
         start(controller) {
             if (earlyData) controller.enqueue(earlyData);
@@ -366,7 +367,7 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
                 try {tcpState.reader.releaseLock()} catch {}
                 if (activeTcpState === tcpState) activeTcpState = null;
                 if (tcpState.closed) return;
-                if (!tcpState.hasRemoteData && nextConnectAttemptIndex < (connectAttempts?.length ?? 0)) return;
+                if (!tcpState.hasRemoteData && !clientWriteStarted && nextConnectAttemptIndex < (connectAttempts?.length ?? 0)) return;
                 closeConnection();
             }
         })();
@@ -399,23 +400,32 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
             new Promise(resolve => setTimeout(() => resolve('timeout'), firstTcpByteTimeoutMs))
         ]);
     };
-    const writeToTcpWithFallback = async (chunk) => {
+    const waitForServerFirstFallback = async () => {
+        while (!clientWriteStarted) {
+            const tcpState = activeTcpState ?? await openNextTcpState();
+            if (!tcpState) throw new Error();
+            const firstRemoteEvent = await waitForFirstRemoteEvent(tcpState);
+            if (firstRemoteEvent === 'data' || clientWriteStarted) return;
+            if (activeTcpState !== tcpState) continue;
+            activeTcpState = null;
+            disposeTcpState(tcpState);
+        }
+    };
+    const writeToTcp = async (chunk) => {
         if (!chunk?.byteLength) return;
         while (true) {
             const tcpState = activeTcpState ?? await openNextTcpState();
             if (!tcpState) throw new Error();
+            clientWriteStarted = true;
             try {
                 await tcpState.writer.write(chunk);
+                clientWriteCommitted = true;
+                return;
             } catch {
                 if (activeTcpState === tcpState) activeTcpState = null;
-                if (tcpState.hasRemoteData) throw new Error();
+                if (clientWriteCommitted || tcpState.hasRemoteData) throw new Error();
                 disposeTcpState(tcpState);
-                continue;
             }
-            const firstRemoteEvent = await waitForFirstRemoteEvent(tcpState);
-            if (firstRemoteEvent === 'data') return;
-            if (activeTcpState === tcpState) activeTcpState = null;
-            disposeTcpState(tcpState);
         }
     };
     webSocketStream.pipeTo(new WritableStream({
@@ -439,8 +449,9 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
             } else {
                 connectAttempts = buildTcpConnectAttempts(parsedRequest, request);
                 if (!await openNextTcpState()) throw new Error();
-                if (payload.byteLength) await writeToTcpWithFallback(payload);
-                messageHandler = writeToTcpWithFallback;
+                if (payload.byteLength) await writeToTcp(payload);
+                else void waitForServerFirstFallback().catch(() => closeConnection());
+                messageHandler = writeToTcp;
             }
         }
     })).catch(() => closeConnection()).finally(() => closeConnection());
