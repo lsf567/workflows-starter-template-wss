@@ -13,7 +13,6 @@ new_sqlite_classes = ["HeavyDo"]
 
 [vars]
 ENABLE_HEAVY_DO = "1"
-HEAVY_DO_SHARDS = "4"
 
 [observability]
 enabled = true
