@@ -17,7 +17,6 @@ const concurrentOnlyDomain = false;//只对域名并发开关
 const concurrency = 1;//socket获取并发数
 // ---------------------------------------------------------------------------------
 const maxInitialRequestBytes = 4096;
-const firstTcpByteTimeoutMs = 2000;
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
 const dohJsonEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
 const dohFetchOptions = {method: 'POST', headers: {'content-type': 'application/dns-message'}};
@@ -97,18 +96,6 @@ const concatUint8Arrays = (left, right) => {
     combined.set(left);
     combined.set(right, left.length);
     return combined;
-};
-const createDeferred = () => {
-    let settled = false;
-    let resolvePromise;
-    const promise = new Promise(resolve => {
-        resolvePromise = value => {
-            if (settled) return;
-            settled = true;
-            resolve(value);
-        };
-    });
-    return {promise, resolve: resolvePromise};
 };
 const isTruthyFlag = (value) => {
     if (typeof value === 'boolean') return value;
@@ -313,7 +300,6 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
     let activeTcpState = null;
     let nextConnectAttemptIndex = 0;
     let connectAttempts = null;
-    let clientWriteStarted = false;
     let clientWriteCommitted = false;
     const webSocketStream = new ReadableStream({
         start(controller) {
@@ -352,22 +338,21 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
                 while (true) {
                     const {value, done} = await tcpState.reader.read();
                     if (done) {
-                        tcpState.firstRemoteEvent.resolve('closed');
                         break;
                     }
                     if (!tcpState.hasRemoteData) {
                         tcpState.hasRemoteData = true;
-                        tcpState.firstRemoteEvent.resolve('data');
                     }
                     webSocket.send(value);
                 }
-            } catch {
-                tcpState.firstRemoteEvent.resolve('error');
-            } finally {
+            } catch {} finally {
                 try {tcpState.reader.releaseLock()} catch {}
                 if (activeTcpState === tcpState) activeTcpState = null;
                 if (tcpState.closed) return;
-                if (!tcpState.hasRemoteData && !clientWriteStarted && nextConnectAttemptIndex < (connectAttempts?.length ?? 0)) return;
+                if (!tcpState.hasRemoteData && !clientWriteCommitted && nextConnectAttemptIndex < (connectAttempts?.length ?? 0)) {
+                    disposeTcpState(tcpState);
+                    return;
+                }
                 closeConnection();
             }
         })();
@@ -385,38 +370,18 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
             reader: connected.tcpSocket.readable.getReader(),
             attemptIndex: connected.attemptIndex,
             closed: false,
-            hasRemoteData: false,
-            firstRemoteEvent: createDeferred()
+            hasRemoteData: false
         };
         nextConnectAttemptIndex = connected.attemptIndex + 1;
         activeTcpState = tcpState;
         startTcpPump(tcpState);
         return tcpState;
     };
-    const waitForFirstRemoteEvent = (tcpState) => {
-        if (tcpState.hasRemoteData) return Promise.resolve('data');
-        return Promise.race([
-            tcpState.firstRemoteEvent.promise,
-            new Promise(resolve => setTimeout(() => resolve('timeout'), firstTcpByteTimeoutMs))
-        ]);
-    };
-    const waitForServerFirstFallback = async () => {
-        while (!clientWriteStarted) {
-            const tcpState = activeTcpState ?? await openNextTcpState();
-            if (!tcpState) throw new Error();
-            const firstRemoteEvent = await waitForFirstRemoteEvent(tcpState);
-            if (firstRemoteEvent === 'data' || clientWriteStarted) return;
-            if (activeTcpState !== tcpState) continue;
-            activeTcpState = null;
-            disposeTcpState(tcpState);
-        }
-    };
     const writeToTcp = async (chunk) => {
         if (!chunk?.byteLength) return;
         while (true) {
             const tcpState = activeTcpState ?? await openNextTcpState();
             if (!tcpState) throw new Error();
-            clientWriteStarted = true;
             try {
                 await tcpState.writer.write(chunk);
                 clientWriteCommitted = true;
@@ -450,7 +415,6 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
                 connectAttempts = buildTcpConnectAttempts(parsedRequest, request);
                 if (!await openNextTcpState()) throw new Error();
                 if (payload.byteLength) await writeToTcp(payload);
-                else void waitForServerFirstFallback().catch(() => closeConnection());
                 messageHandler = writeToTcp;
             }
         }
