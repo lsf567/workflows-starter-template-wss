@@ -10,8 +10,6 @@ import {DurableObject} from 'cloudflare:workers';
 import {connect} from 'cloudflare:sockets';
 const defaultEnableHeavyDo = true;
 const uuid = '374b719e-1487-49ac-8303-1697301950d6';//vless使用的uuid
-const heavyDoShardCount = 1;//仅在显式启用 ENABLE_HEAVY_DO 时生效
-const maxHeavyDoShardCount = 4;
 // ---------------------------------------------------------------------------------
 /** TCPsocket并发获取，可提高tcp连接成功率*/
 const concurrentOnlyDomain = false;//只对域名并发开关
@@ -19,6 +17,7 @@ const concurrentOnlyDomain = false;//只对域名并发开关
 const concurrency = 1;//socket获取并发数
 // ---------------------------------------------------------------------------------
 const maxInitialRequestBytes = 4096;
+const firstTcpByteTimeoutMs = 2000;
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
 const dohJsonEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
 const dohFetchOptions = {method: 'POST', headers: {'content-type': 'application/dns-message'}};
@@ -100,6 +99,18 @@ const concatUint8Arrays = (left, right) => {
     combined.set(right, left.length);
     return combined;
 };
+const createDeferred = () => {
+    let settled = false;
+    let resolvePromise;
+    const promise = new Promise(resolve => {
+        resolvePromise = value => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
+    });
+    return {promise, resolve: resolvePromise};
+};
 const isTruthyFlag = (value) => {
     if (typeof value === 'boolean') return value;
     if (typeof value === 'number') return value !== 0;
@@ -156,7 +167,17 @@ const concurrentConnect = (hostname, port, addrType) => {
     return connectAny(Array(concurrency).fill(null).map(() => ({host: hostname, port})));
 };
 const parseAddress = (buffer, offset, addrType) => {
-    const addressLength = addrType === 3 ? buffer[offset++] : addrType === 1 ? 4 : addrType === 4 ? 16 : null;
+    let addressLength;
+    if (addrType === 3) {
+        if (offset >= buffer.length) return {status: 'incomplete'};
+        addressLength = buffer[offset++];
+    } else if (addrType === 1) {
+        addressLength = 4;
+    } else if (addrType === 4) {
+        addressLength = 16;
+    } else {
+        addressLength = null;
+    }
     if (addressLength === null) return {status: 'invalid'};
     const newOffset = offset + addressLength;
     if (newOffset > buffer.length) return {status: 'incomplete'};
@@ -226,6 +247,15 @@ const connectDirect = ({addrType, port, targetAddrBytes}) => {
     const hostname = binaryAddrToString(addrType, targetAddrBytes);
     return concurrentConnect(hostname, port, addrType);
 };
+const buildTcpConnectAttempts = (parsedRequest, request) => {
+    const params = parseConnectionParams(request.url);
+    return [
+        () => connectDirect(parsedRequest),
+        () => executeDecodedIpStrategies(params.ip),
+        () => connectProxyIp(coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US),
+        () => concurrentConnect(finallyProxyHost, 443, 3)
+    ];
+};
 const executeDecodedIpStrategies = async (rawParam) => {
     if (!rawParam) return null;
     let decodedParam;
@@ -245,17 +275,10 @@ const executeDecodedIpStrategies = async (rawParam) => {
     }
     return null;
 };
-const establishTcpConnection = async (parsedRequest, request) => {
-    const params = parseConnectionParams(request.url);
-    const attempts = [
-        () => connectDirect(parsedRequest),
-        () => executeDecodedIpStrategies(params.ip),
-        () => connectProxyIp(coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US),
-        () => concurrentConnect(finallyProxyHost, 443, 3)
-    ];
-    for (const attempt of attempts) {
-        const tcpSocket = await attempt();
-        if (tcpSocket) return tcpSocket;
+const establishTcpConnection = async (connectAttempts, startIndex = 0) => {
+    for (let i = startIndex; i < connectAttempts.length; i++) {
+        const tcpSocket = await connectAttempts[i]();
+        if (tcpSocket) return {tcpSocket, attemptIndex: i};
     }
     return null;
 };
@@ -288,6 +311,9 @@ const normalizeWsChunk = (chunk) => chunk instanceof Uint8Array ? chunk : typeof
 const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketEarlyData(request)) => {
     let streamClosed = false;
     let pendingFirstChunk = null;
+    let activeTcpState = null;
+    let nextConnectAttemptIndex = 0;
+    let connectAttempts = null;
     const webSocketStream = new ReadableStream({
         start(controller) {
             if (earlyData) controller.enqueue(earlyData);
@@ -305,14 +331,92 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
         },
         cancel() {webSocket.close()}
     });
-    let messageHandler, tcpSocket, tcpWriter;
-    const closeSocket = () => {
+    let messageHandler;
+    const disposeTcpState = (tcpState) => {
+        if (!tcpState || tcpState.closed) return;
+        tcpState.closed = true;
+        try {tcpState.writer?.releaseLock()} catch {}
+        closeSocketQuietly(tcpState.socket);
+    };
+    const closeConnection = () => {
         messageHandler = null;
-        try {tcpWriter?.releaseLock()} catch {}
-        tcpWriter = null;
-        closeSocketQuietly(tcpSocket);
-        tcpSocket = null;
+        const tcpState = activeTcpState;
+        activeTcpState = null;
+        disposeTcpState(tcpState);
         closeWebSocketQuietly(webSocket);
+    };
+    const startTcpPump = (tcpState) => {
+        tcpState.pumpPromise = (async () => {
+            try {
+                while (true) {
+                    const {value, done} = await tcpState.reader.read();
+                    if (done) {
+                        tcpState.firstRemoteEvent.resolve('closed');
+                        break;
+                    }
+                    if (!tcpState.hasRemoteData) {
+                        tcpState.hasRemoteData = true;
+                        tcpState.firstRemoteEvent.resolve('data');
+                    }
+                    webSocket.send(value);
+                }
+            } catch {
+                tcpState.firstRemoteEvent.resolve('error');
+            } finally {
+                try {tcpState.reader.releaseLock()} catch {}
+                if (activeTcpState === tcpState) activeTcpState = null;
+                if (tcpState.closed) return;
+                if (!tcpState.hasRemoteData && nextConnectAttemptIndex < (connectAttempts?.length ?? 0)) return;
+                closeConnection();
+            }
+        })();
+    };
+    const openNextTcpState = async () => {
+        if (!connectAttempts || nextConnectAttemptIndex >= connectAttempts.length) return null;
+        const connected = await establishTcpConnection(connectAttempts, nextConnectAttemptIndex);
+        if (!connected) {
+            nextConnectAttemptIndex = connectAttempts.length;
+            return null;
+        }
+        const tcpState = {
+            socket: connected.tcpSocket,
+            writer: connected.tcpSocket.writable.getWriter(),
+            reader: connected.tcpSocket.readable.getReader(),
+            attemptIndex: connected.attemptIndex,
+            closed: false,
+            hasRemoteData: false,
+            firstRemoteEvent: createDeferred()
+        };
+        nextConnectAttemptIndex = connected.attemptIndex + 1;
+        activeTcpState = tcpState;
+        startTcpPump(tcpState);
+        return tcpState;
+    };
+    const waitForFirstRemoteEvent = (tcpState) => {
+        if (tcpState.hasRemoteData) return Promise.resolve('data');
+        return Promise.race([
+            tcpState.firstRemoteEvent.promise,
+            new Promise(resolve => setTimeout(() => resolve('timeout'), firstTcpByteTimeoutMs))
+        ]);
+    };
+    const writeToTcpWithFallback = async (chunk) => {
+        if (!chunk?.byteLength) return;
+        while (true) {
+            const tcpState = activeTcpState ?? await openNextTcpState();
+            if (!tcpState) throw new Error();
+            try {
+                await tcpState.writer.write(chunk);
+            } catch {
+                if (activeTcpState === tcpState) activeTcpState = null;
+                if (tcpState.hasRemoteData) throw new Error();
+                disposeTcpState(tcpState);
+                continue;
+            }
+            const firstRemoteEvent = await waitForFirstRemoteEvent(tcpState);
+            if (firstRemoteEvent === 'data') return;
+            if (activeTcpState === tcpState) activeTcpState = null;
+            disposeTcpState(tcpState);
+        }
     };
     webSocketStream.pipeTo(new WritableStream({
         async write(chunk) {
@@ -333,15 +437,13 @@ const handleWebSocketConn = async (webSocket, request, earlyData = getWebSocketE
                 webSocket.send(await dohDnsHandler(payload));
                 webSocket.close();
             } else {
-                tcpSocket = await establishTcpConnection(parsedRequest, request);
-                if (!tcpSocket) throw new Error();
-                tcpWriter = tcpSocket.writable.getWriter();
-                if (payload.byteLength) await tcpWriter.write(payload);
-                messageHandler = tcpWriter.write.bind(tcpWriter);
-                tcpSocket.readable.pipeTo(new WritableStream({write(chunk) {webSocket.send(chunk)}})).catch(() => closeSocket()).finally(() => closeSocket());
+                connectAttempts = buildTcpConnectAttempts(parsedRequest, request);
+                if (!await openNextTcpState()) throw new Error();
+                if (payload.byteLength) await writeToTcpWithFallback(payload);
+                messageHandler = writeToTcpWithFallback;
             }
         }
-    })).catch(() => closeSocket()).finally(() => closeSocket());
+    })).catch(() => closeConnection()).finally(() => closeConnection());
 };
 const isWebSocketUpgrade = (request) => request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 const shouldHandleDnsInWorker = (request, env, earlyData = getWebSocketEarlyData(request)) => {
@@ -349,22 +451,7 @@ const shouldHandleDnsInWorker = (request, env, earlyData = getWebSocketEarlyData
     const parsedRequest = parseRequestData(earlyData);
     return !!parsedRequest?.isDns;
 };
-const getConfiguredHeavyDoShardCount = (env) => {
-    const rawValue = Number.parseInt(env?.HEAVY_DO_SHARDS ?? `${heavyDoShardCount}`, 10);
-    if (!Number.isFinite(rawValue)) return heavyDoShardCount;
-    return Math.min(maxHeavyDoShardCount, Math.max(1, rawValue));
-};
-const hashString = (input) => {
-    let hash = 0;
-    for (let i = 0; i < input.length; i++) hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
-    return hash;
-};
-const getHeavyDoName = (request, env) => {
-    const shardCount = getConfiguredHeavyDoShardCount(env);
-    if (shardCount <= 1) return 'singleton';
-    const clientKey = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || request.headers.get('sec-websocket-key') || 'default';
-    return `shard:${hashString(clientKey) % shardCount}`;
-};
+const getHeavyDoName = () => 'singleton';
 const shouldOffloadToHeavyDo = (request, env) => isHeavyDoEnabled(env) && isWebSocketUpgrade(request);
 const routeToHeavyDo = (request, env) => {
     const id = env.HEAVY_DO.idFromName(getHeavyDoName(request, env));
