@@ -173,14 +173,18 @@ const parseAddress = (buffer, offset, addrType) => {
 const parseRequestDataState = (firstChunk) => {
     if (firstChunk.length < 24) return {status: 'incomplete'};
     for (let i = 0; i < 16; i++) if (firstChunk[i + 1] !== uuidBytes[i]) return {status: 'invalid'};
-    let offset = 19 + firstChunk[17];
-    if (offset + 3 > firstChunk.length) return {status: 'incomplete'};
-    const port = (firstChunk[offset] << 8) | firstChunk[offset + 1];
-    let addrType = firstChunk[offset + 2];
-    if (addrType !== 1) addrType += 1;
-    const addressInfo = parseAddress(firstChunk, offset + 3, addrType);
+    const commandIndex = 18 + firstChunk[17];
+    if (commandIndex + 4 > firstChunk.length) return {status: 'incomplete'};
+    const cmd = firstChunk[commandIndex];
+    const port = (firstChunk[commandIndex + 1] << 8) | firstChunk[commandIndex + 2];
+    const rawAddrType = firstChunk[commandIndex + 3];
+    const isDns = cmd === 2 && port === 53;
+    if (cmd !== 1 && !isDns) return {status: 'invalid'};
+    const addrType = rawAddrType === 1 ? 1 : rawAddrType === 2 ? 3 : rawAddrType === 3 ? 4 : null;
+    if (addrType === null) return {status: 'invalid'};
+    const addressInfo = parseAddress(firstChunk, commandIndex + 4, addrType);
     if (addressInfo.status !== 'ok') return addressInfo;
-    return {status: 'ok', parsedRequest: {addrType, targetAddrBytes: addressInfo.targetAddrBytes, dataOffset: addressInfo.dataOffset, port, isDns: port === 53}};
+    return {status: 'ok', parsedRequest: {addrType, targetAddrBytes: addressInfo.targetAddrBytes, dataOffset: addressInfo.dataOffset, port, isDns}};
 };
 const parseRequestData = (firstChunk) => {
     const parseResult = parseRequestDataState(firstChunk);
