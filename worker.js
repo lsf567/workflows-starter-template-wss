@@ -115,20 +115,31 @@ const isTruthyFlag = (value) => {
     }
 };
 const isHeavyDoEnabled = (env) => !!env?.HEAVY_DO && isTruthyFlag(env?.ENABLE_HEAVY_DO ?? defaultEnableHeavyDo);
-const createConnect = (hostname, port, socket = connect({hostname, port})) => socket.opened.then(() => socket);
-const concurrentConnect = (hostname, port, addrType) => {
-    if (concurrency === 1 || (concurrentOnlyDomain && addrType !== 3)) return createConnect(hostname, port);
-    return Promise.any(Array(concurrency).fill(null).map(() => createConnect(hostname, port)));
+const createConnectAttempt = (hostname, port) => {
+    let socket;
+    try {
+        socket = connect({hostname, port});
+    } catch {
+        return null;
+    }
+    const ready = socket.opened.then(() => socket).catch(error => {
+        closeSocketQuietly(socket);
+        throw error;
+    });
+    return {socket, ready};
+};
+const createConnect = async (hostname, port) => {
+    const attempt = createConnectAttempt(hostname, port);
+    if (!attempt) return null;
+    try {
+        return await attempt.ready;
+    } catch {
+        return null;
+    }
 };
 const connectAny = async (targets) => {
-    const attempts = targets.map(({host, port}) => {
-        const socket = connect({hostname: host, port});
-        const ready = socket.opened.then(() => socket).catch(error => {
-            closeSocketQuietly(socket);
-            throw error;
-        });
-        return {socket, ready};
-    });
+    const attempts = targets.map(({host, port}) => createConnectAttempt(host, port)).filter(Boolean);
+    if (attempts.length === 0) return null;
     try {
         const winner = await Promise.any(attempts.map(attempt => attempt.ready));
         for (const attempt of attempts) {
@@ -139,6 +150,10 @@ const connectAny = async (targets) => {
         for (const attempt of attempts) closeSocketQuietly(attempt.socket);
         return null;
     }
+};
+const concurrentConnect = (hostname, port, addrType) => {
+    if (concurrency === 1 || (concurrentOnlyDomain && addrType !== 3)) return createConnect(hostname, port);
+    return connectAny(Array(concurrency).fill(null).map(() => ({host: hostname, port})));
 };
 const parseAddress = (buffer, offset, addrType) => {
     const addressLength = addrType === 3 ? buffer[offset++] : addrType === 1 ? 4 : addrType === 4 ? 16 : null;
@@ -189,6 +204,7 @@ const williamResult = async (william) => {
     return prefixes;
 };
 const connectProxyIp = async (param) => {
+    if (!param) return null;
     if (param.includes('.william')) {
         const resolvedIps = await williamResult(param);
         if (!resolvedIps || resolvedIps.length === 0) return null;
@@ -212,7 +228,12 @@ const connectDirect = ({addrType, port, targetAddrBytes}) => {
 };
 const executeDecodedIpStrategies = async (rawParam) => {
     if (!rawParam) return null;
-    const decodedParam = decodeURIComponent(rawParam);
+    let decodedParam;
+    try {
+        decodedParam = decodeURIComponent(rawParam);
+    } catch {
+        decodedParam = rawParam;
+    }
     let itemStart = 0;
     for (let i = 0; i <= decodedParam.length; i++) {
         if (i !== decodedParam.length && decodedParam.charCodeAt(i) !== 44) continue;
@@ -226,13 +247,17 @@ const executeDecodedIpStrategies = async (rawParam) => {
 };
 const establishTcpConnection = async (parsedRequest, request) => {
     const params = parseConnectionParams(request.url);
-    const directSocket = await connectDirect(parsedRequest);
-    if (directSocket) return directSocket;
-    const proxyIpSocket = await executeDecodedIpStrategies(params.ip);
-    if (proxyIpSocket) return proxyIpSocket;
-    const regionalProxySocket = await connectProxyIp(coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US);
-    if (regionalProxySocket) return regionalProxySocket;
-    return concurrentConnect(finallyProxyHost, 443, 3);
+    const attempts = [
+        () => connectDirect(parsedRequest),
+        () => executeDecodedIpStrategies(params.ip),
+        () => connectProxyIp(coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US),
+        () => concurrentConnect(finallyProxyHost, 443, 3)
+    ];
+    for (const attempt of attempts) {
+        const tcpSocket = await attempt();
+        if (tcpSocket) return tcpSocket;
+    }
+    return null;
 };
 const dohDnsHandler = async (payload) => {
     if (payload.byteLength < 2) throw new Error();
