@@ -39,7 +39,7 @@ const coloToProxyMap = new Map(Object.entries(coloRegions).flatMap(([region, col
 const uuidBytes = new Uint8Array(16), offsets = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4, 4];
 for (let i = 0, c; i < 16; i++) uuidBytes[i] = (((c = uuid.charCodeAt(i * 2 + offsets[i])) > 64 ? c + 9 : c) & 0xF) << 4 | (((c = uuid.charCodeAt(i * 2 + offsets[i] + 1)) > 64 ? c + 9 : c) & 0xF);
 const [textEncoder, textDecoder] = [new TextEncoder(), new TextDecoder()];
-const html = `<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx/1.25.3</center></body></html>`;
+const html = `<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx/1.29.6</center></body></html>`;
 const binaryAddrToString = (addrType, addrBytes) => {
     if (addrType === 3) return textDecoder.decode(addrBytes);
     if (addrType === 1) return `${addrBytes[0]}.${addrBytes[1]}.${addrBytes[2]}.${addrBytes[3]}`;
@@ -458,7 +458,7 @@ const shouldHandleDnsInWorker = (request, env, earlyData = getWebSocketEarlyData
 const getHeavyDoName = () => 'singleton';
 const shouldOffloadToHeavyDo = (request, env) => isHeavyDoEnabled(env) && isWebSocketUpgrade(request);
 const routeToHeavyDo = (request, env) => {
-    const id = env.HEAVY_DO.idFromName(getHeavyDoName(request, env));
+    const id = env.HEAVY_DO.idFromName(getHeavyDoName());
     return env.HEAVY_DO.get(id).fetch(request);
 };
 const handleRequest = (request, earlyData = getWebSocketEarlyData(request)) => {
